@@ -49,17 +49,14 @@
 
 
 ### 📊 博客数据
-![总访问量](https://visitor-badge.glitch.me/badge?page_id=你的用户名.你的用户名.github.io&left_color=blue&right_color=red)  
+![总访问量](https://visitor-badge.glitch.me/badge?page_id=WuDjung.github.io&left_color=blue&right_color=red)  
 ![文章总数](https://img.shields.io/badge/文章总数-[X]篇-blue)  
 ![最后更新](https://img.shields.io/badge/最后更新-[2024-XX-XX]-green)
 
 
----
 
 > 📄 本页面持续更新，欢迎 Star 我的 GitHub 仓库关注动态 🌟  
-> © 2024 [你的名字/用户名] | 基于 [MIT License](https://opensource.org/licenses/MIT) 开源
-
----
+> © 2025 [乌江鱼] | 基于 [MIT License](https://opensource.org/licenses/MIT) 开源
 
 
 ### 补充说明
