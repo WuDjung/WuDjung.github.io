@@ -37,10 +37,10 @@
 
 
 ### 📌 代表性项目
-1. **[项目名称1：如“个人博客系统（React+Node.js）”]**  
-   📝 简介：[1句话说明功能，如“支持Markdown编辑、分类标签、暗黑模式的个人博客后台与前端”]  
+1. **[项目名称1：云边端分布式并行加速计算**  
+   📝 简介：[支持云服务器与旧笔记本和树莓派构建分布式并行加速计算]  
    💻 技术栈：[React + Express + MongoDB]  
-   🔗 仓库：[https://github.com/你的用户名/项目1仓库](https://github.com/你的用户名/项目1仓库) | 演示：[https://你的github.io/项目1演示](https://你的github.io/项目1演示)
+   🔗 仓库：https://github.com/WuDjung/Ray-Cross-Reg-Container-Cluster-Setup-Notes
 
 2. **[项目名称2：如“校园二手书交易小程序”]**  
    📝 简介：[1句话说明，如“解决校园二手书流通问题，支持发布、搜索、聊天功能”]  
