@@ -232,7 +232,7 @@ plt.plot(final_x*K, final_u*K, 'b-', label=f'最终结果 (自适应步骤 {len(
 init_x, init_u, _, _ = adapt_results[0]
 plt.plot(init_x*K, init_u*K, 'k--', alpha=0.5, label=f'初始结果 (单元数 {adapt_results[0][2]})')
 
-plt.axvline(K, ls='--', color='gray', label='执行价 K')
+plt.axvline(K, ls='--', color='green', label='执行价 K')
 plt.xlabel('标的资产价格 S')
 plt.ylabel('期权价值 V')
 plt.title('自适应hp-FEM求解结果')
