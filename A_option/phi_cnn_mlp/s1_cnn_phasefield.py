@@ -10,8 +10,11 @@ scheme1_cnn_phasefield.py
   4. φ 标签用距离变换+sigmoid 替代高斯平滑
   5. EMA (Exponential Moving Average) for v_net in Stage 2
   6. 分阶段计时器
+  7. EMA 延迟至 CNN 冻结期结束后启动
+  8. 保存结果时确保使用 Stage 3 best restored 参数
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -63,7 +66,7 @@ class Config:
     # 训练
     stage1_epochs = 3000
     stage1_lr = 2e-3
-    stage15_epochs = 1500
+    stage15_epochs = 500
     stage15_lr = 2e-3
     stage2_epochs = 20000
     stage2_lr_mlp = 5e-4
@@ -74,6 +77,9 @@ class Config:
     anchor_decay_start = 10000
     anchor_decay_end = 20000
     anchor_min_ratio = 0.3
+
+    # Stage 2: CNN 冻结期
+    stage2_cnn_freeze_epochs = 5000
 
     # EMA
     ema_decay = 0.999
@@ -304,6 +310,7 @@ fdm_boundary = extract_fdm_boundary(S_fdm, t_fdm, V_fdm, cfg.K)
 # ============================================================
 timer.start("DataPrep")
 
+
 def get_fdm_on_grid(cfg, fdm_interp):
     S_np = np.linspace(0, cfg.S_max, cfg.grid_S)
     t_np = np.linspace(0, cfg.T, cfg.grid_t)
@@ -527,23 +534,49 @@ def focal_bce(pred, target, gamma=2.0):
 
 
 def compute_bc_loss(v_net, cfg):
-    n_bc = cfg.grid_t
-    t_bc = torch.linspace(0, 1, n_bc, device=cfg.device).unsqueeze(1)
+    """边界条件损失: V(0,t)=K, V(S_max,t)=0, V(S,T)=payoff.
 
-    bc_left = F.mse_loss(
-        v_net(torch.zeros(n_bc, 1, device=cfg.device), t_bc),
-        torch.ones(n_bc, 1, device=cfg.device)
-    )
-    bc_right = F.mse_loss(
-        v_net(torch.ones(n_bc, 1, device=cfg.device), t_bc),
-        torch.zeros(n_bc, 1, device=cfg.device)
-    )
+    将三组 BC 点合并为一次前向传播, 再按索引切分计算 MSE.
+    总点数: n_bc_left + n_bc_right + n_bc_terminal
+          = grid_t   + grid_t     + grid_S
+    """
+    n_t = cfg.grid_t
+    n_S = cfg.grid_S
+    device = cfg.device
 
-    n_tc = cfg.grid_S
-    S_tc = torch.linspace(0, 1, n_tc, device=cfg.device).unsqueeze(1)
-    t_tc = torch.ones(n_tc, 1, device=cfg.device)
-    target_tc = torch.clamp(1.0 - S_tc * cfg.S_max / cfg.K, min=0.0)
-    bc_terminal = F.mse_loss(v_net(S_tc, t_tc), target_tc)
+    # ---- 构建三组 BC 点 ----
+    t_bc = torch.linspace(0, 1, n_t, device=device)
+
+    # 左边界: S=0, t∈[0,1]  → target = 1.0 (即 V=K)
+    S_left = torch.zeros(n_t, device=device)
+    t_left = t_bc
+    tgt_left = torch.ones(n_t, device=device)
+
+    # 右边界: S=1, t∈[0,1]  → target = 0.0
+    S_right = torch.ones(n_t, device=device)
+    t_right = t_bc
+    tgt_right = torch.zeros(n_t, device=device)
+
+    # 终端条件: S∈[0,1], t=1  → target = max(1 - S*S_max/K, 0)
+    S_term = torch.linspace(0, 1, n_S, device=device)
+    t_term = torch.ones(n_S, device=device)
+    tgt_term = torch.clamp(1.0 - S_term * cfg.S_max / cfg.K, min=0.0)
+
+    # ---- 合并为一个 batch, 一次前向 ----
+    S_all = torch.cat([S_left, S_right, S_term]).unsqueeze(1)   # (n_t+n_t+n_S, 1)
+    t_all = torch.cat([t_left, t_right, t_term]).unsqueeze(1)   # (n_t+n_t+n_S, 1)
+    tgt_all = torch.cat([tgt_left, tgt_right, tgt_term])        # (n_t+n_t+n_S,)
+
+    V_all = v_net(S_all, t_all).squeeze(-1)  # (n_t+n_t+n_S,)
+
+    # ---- 按索引切分, 分别计算 MSE 再求和 ----
+    pred_left = V_all[:n_t]
+    pred_right = V_all[n_t:2 * n_t]
+    pred_term = V_all[2 * n_t:]
+
+    bc_left = F.mse_loss(pred_left, tgt_left)
+    bc_right = F.mse_loss(pred_right, tgt_right)
+    bc_terminal = F.mse_loss(pred_term, tgt_term)
 
     return bc_left + bc_right + bc_terminal
 
@@ -553,12 +586,12 @@ def compute_rel_err(v_net, S_flat, t_flat, V_fdm_grid, cfg):
         V_pred = v_net(S_flat, t_flat).reshape(cfg.grid_t, cfg.grid_S) * cfg.K
         return (torch.norm(V_pred - V_fdm_grid) / (torch.norm(V_fdm_grid) + 1e-8)).item()
 
+
 class WarmupCosineScheduler:
     """线性 Warmup + Cosine Decay 学习率调度.
-    
+
     epoch 0 ~ warmup_epochs-1:  lr 从 lr_max * warmup_ratio 线性增到 lr_max
     epoch warmup_epochs ~ total_epochs-1:  lr 从 lr_max 余弦衰减到 eta_min
-
     """
 
     def __init__(self, optimizer, total_epochs, warmup_epochs,
@@ -588,7 +621,6 @@ class WarmupCosineScheduler:
                 # Cosine decay: lr_max → eta_min
                 cos_steps = self.total_epochs - self.warmup_epochs
                 cos_progress = step - self.warmup_epochs
-                import math
                 lr = self.eta_min + 0.5 * (base_lr - self.eta_min) * (
                     1 + math.cos(math.pi * cos_progress / cos_steps))
             lrs.append(lr)
@@ -604,6 +636,8 @@ class WarmupCosineScheduler:
 
     def get_last_lr(self):
         return [pg['lr'] for pg in self.optimizer.param_groups]
+
+
 # ============================================================
 # Stage 1: MLP 预热 (FDM 监督)
 # ============================================================
@@ -675,7 +709,7 @@ history_s1_5 = {'stage15_bce_list': [],
                 'stage15_cont_frac_list': [],
                 }
 
-log_interval_15 = 300
+log_interval_15 = 100
 
 for epoch in range(1, cfg.stage15_epochs + 1):
     phi_net.train()
@@ -726,23 +760,25 @@ print(f"Stage 1.5 耗时 {s15_time:.1f}s")
 
 
 # ============================================================
-# Stage 2: 联合训练 (Phase-Field Energy + Anchor + EMA)
+# Stage 2: 联合训练 (CNN 冻结期 + Phase-Field Energy + Anchor + EMA)
 # ============================================================
 print("\n" + "=" * 70)
 print("Stage 2: 联合训练 (Phase-Field Energy + Anchor + EMA)")
+print(f"  CNN 冻结期: epoch 1-{cfg.stage2_cnn_freeze_epochs}")
+print(f"  CNN 解冻后联合训练: epoch {cfg.stage2_cnn_freeze_epochs + 1}-{cfg.stage2_epochs}")
+print(f"  EMA 将在冻结期结束后启动")
 print("=" * 70)
 timer.start("Stage2_Joint")
 
 opt_mlp = torch.optim.AdamW(v_net.parameters(), lr=cfg.stage2_lr_mlp, weight_decay=1e-5)
 opt_cnn = torch.optim.AdamW(phi_net.parameters(), lr=cfg.stage2_lr_cnn, weight_decay=1e-5)
 
-# ---- 修改: Warmup + Cosine Decay 替换 CosineAnnealingLR ----
 sch_mlp = WarmupCosineScheduler(
     opt_mlp,
     total_epochs=cfg.stage2_epochs,
-    warmup_epochs=1000,        # 5% of 20000
+    warmup_epochs=1000,
     eta_min=1e-6,
-    warmup_ratio=0.1           # 从 lr_max 的 1/10 起步
+    warmup_ratio=0.1
 )
 sch_cnn = WarmupCosineScheduler(
     opt_cnn,
@@ -752,21 +788,35 @@ sch_cnn = WarmupCosineScheduler(
     warmup_ratio=0.1
 )
 
-# 初始化 EMA
-ema = EMA(v_net, decay=cfg.ema_decay)
+# EMA 延迟初始化: 冻结期结束后再创建
+ema = None
 
 history_s2 = {
     'pde': [], 'exercise': [], 'interface': [], 'anchor': [],
     'balance': [], 'bc': [], 'total': [],
     'rel_err_raw': [], 'rel_err_ema': [],
-    'lr_mlp': [], 'lr_cnn': []          # 新增: 记录 lr 曲线
+    'lr_mlp': [], 'lr_cnn': [],
+    'cnn_frozen': []
 }
 
 phi_anchor_flat = phi_target.reshape(-1, 1)
 
+
+# 日志间隔: 冻结期每 500 epoch, 解冻后每 1000 epoch
+def get_log_interval(epoch):
+    if epoch <= cfg.stage2_cnn_freeze_epochs:
+        return 500
+    return 1000
+
+
 for epoch in range(1, cfg.stage2_epochs + 1):
     v_net.train()
-    phi_net.train()
+    cnn_frozen = (epoch <= cfg.stage2_cnn_freeze_epochs)
+
+    if cnn_frozen:
+        phi_net.eval()
+    else:
+        phi_net.train()
 
     # ---- 1. V 前向 + BS 残差 ----
     V_norm_pred, bs_residual = compute_bs_residual(v_net, S_flat, t_flat, cfg)
@@ -774,8 +824,15 @@ for epoch in range(1, cfg.stage2_epochs + 1):
     # ---- 2. φ (CNN) ----
     V_map = V_norm_pred.detach().reshape(1, 1, cfg.grid_t, cfg.grid_S)
     cnn_input = torch.cat([S_grid, t_grid, V_map], dim=1)
-    phi_full = phi_net(cnn_input)
-    phi_2d = phi_full.squeeze()
+
+    if cnn_frozen:
+        with torch.no_grad():
+            phi_full = phi_net(cnn_input)
+        phi_2d = phi_full.squeeze().detach().requires_grad_(False)
+    else:
+        phi_full = phi_net(cnn_input)
+        phi_2d = phi_full.squeeze()
+
     phi_flat = phi_2d.reshape(-1, 1)
 
     # ---- 3. Phase-Field Energy ----
@@ -807,32 +864,50 @@ for epoch in range(1, cfg.stage2_epochs + 1):
         anchor_w = cfg.lambda_anchor * (1.0 - progress * (1.0 - cfg.anchor_min_ratio))
 
     # ---- 总损失 ----
-    total = (cfg.lambda_pde * pde_loss
-             + cfg.lambda_ex * exercise_loss
-             + cfg.lambda_int * interface_loss
-             + anchor_w * anchor_loss
-             + cfg.lambda_balance * balance_loss
-             + cfg.lambda_bc * bc_loss)
+    if cnn_frozen:
+        total = (cfg.lambda_pde * pde_loss
+                 + cfg.lambda_ex * exercise_loss
+                 + cfg.lambda_bc * bc_loss)
+    else:
+        total = (cfg.lambda_pde * pde_loss
+                 + cfg.lambda_ex * exercise_loss
+                 + cfg.lambda_int * interface_loss
+                 + anchor_w * anchor_loss
+                 + cfg.lambda_balance * balance_loss
+                 + cfg.lambda_bc * bc_loss)
 
     # ---- 反向传播 ----
     opt_mlp.zero_grad()
-    opt_cnn.zero_grad()
+    if not cnn_frozen:
+        opt_cnn.zero_grad()
+
     total.backward()
     torch.nn.utils.clip_grad_norm_(v_net.parameters(), 1.0)
-    torch.nn.utils.clip_grad_norm_(phi_net.parameters(), 1.0)
     opt_mlp.step()
-    opt_cnn.step()
     sch_mlp.step()
+
+    if not cnn_frozen:
+        torch.nn.utils.clip_grad_norm_(phi_net.parameters(), 1.0)
+        opt_cnn.step()
     sch_cnn.step()
 
-    # ---- EMA 更新 ----
-    ema.update()
+    # ---- EMA: 冻结期结束后启动 ----
+    if not cnn_frozen:
+        if ema is None:
+            # 冻结期刚结束, 用当前 MLP 参数初始化 EMA 影子参数
+            ema = EMA(v_net, decay=cfg.ema_decay)
+            print(f"  [Epoch {epoch}] EMA 已初始化 (冻结期结束)")
+        else:
+            ema.update()
 
     # ---- 记录 ----
     rel_err_raw = compute_rel_err(v_net, S_flat, t_flat, V_fdm_grid, cfg)
-    ema.apply_shadow()
-    rel_err_ema = compute_rel_err(v_net, S_flat, t_flat, V_fdm_grid, cfg)
-    ema.restore()
+    if ema is not None:
+        ema.apply_shadow()
+        rel_err_ema = compute_rel_err(v_net, S_flat, t_flat, V_fdm_grid, cfg)
+        ema.restore()
+    else:
+        rel_err_ema = rel_err_raw  # 冻结期内无 EMA, 用 raw 代替
 
     cur_lr_mlp = sch_mlp.get_last_lr()[0]
     cur_lr_cnn = sch_cnn.get_last_lr()[0]
@@ -848,14 +923,17 @@ for epoch in range(1, cfg.stage2_epochs + 1):
     history_s2['rel_err_ema'].append(rel_err_ema)
     history_s2['lr_mlp'].append(cur_lr_mlp)
     history_s2['lr_cnn'].append(cur_lr_cnn)
+    history_s2['cnn_frozen'].append(cnn_frozen)
 
-    if epoch % 1000 == 0:
+    log_interval = get_log_interval(epoch)
+    if epoch % log_interval == 0 or epoch == cfg.stage2_cnn_freeze_epochs + 1:
+        frozen_tag = " [CNN frozen]" if cnn_frozen else " [Joint]"
         with torch.no_grad():
             p = phi_2d
-            print(f"  Epoch {epoch}/{cfg.stage2_epochs} | "
+            print(f"  Epoch {epoch}/{cfg.stage2_epochs}{frozen_tag} | "
                   f"PDE={pde_loss.item():.6f} | Ex={exercise_loss.item():.6f} | "
                   f"Int={interface_loss.item():.4f} | Anc={anchor_loss.item():.6f} | "
-                  f"Bal={balance_loss.item():.6f} | BC={bc_loss.item():.6f} | "
+                  f"BC={bc_loss.item():.6f} | "
                   f"Total={total.item():.4f} | "
                   f"RelErr(raw)={rel_err_raw:.4f} | RelErr(ema)={rel_err_ema:.4f} | "
                   f"AncW={anchor_w:.1f} | "
@@ -870,25 +948,33 @@ print(f"  最终 RelErr(ema) = {history_s2['rel_err_ema'][-1]:.6f}")
 # ============================================================
 # Stage 2 → Stage 3 过渡: 保存 raw 参数, 切换到 EMA
 # ============================================================
-# 保存 raw (非 EMA) 的 checkpoint
-torch.save({
-    'v_net_raw': v_net.state_dict(),
-    'phi_net': phi_net.state_dict(),
-    'ema': ema.state_dict(),
-}, 'scheme1_stage2_raw.pth')
-print("已保存 Stage 2 raw checkpoint → scheme1_stage2_raw.pth")
+if ema is not None:
+    # 保存 raw (非 EMA) 的 checkpoint
+    torch.save({
+        'v_net_raw': v_net.state_dict(),
+        'phi_net': phi_net.state_dict(),
+        'ema': ema.state_dict(),
+    }, 'scheme1_stage2_raw.pth')
+    print("已保存 Stage 2 raw checkpoint → scheme1_stage2_raw.pth")
 
-# 永久切换到 EMA 参数 (不再 restore)
-ema.apply_shadow()
-rel_err_after_ema = compute_rel_err(v_net, S_flat, t_flat, V_fdm_grid, cfg)
-print(f"EMA 参数已应用. RelErr(ema→active) = {rel_err_after_ema:.6f}")
+    # 永久切换到 EMA 参数 (不再 restore)
+    ema.apply_shadow()
+    rel_err_after_ema = compute_rel_err(v_net, S_flat, t_flat, V_fdm_grid, cfg)
+    print(f"EMA 参数已应用. RelErr(ema→active) = {rel_err_after_ema:.6f}")
+else:
+    # 防御: 冻结期 >= 总 epoch 数时不会有 EMA
+    torch.save({
+        'v_net_raw': v_net.state_dict(),
+        'phi_net': phi_net.state_dict(),
+    }, 'scheme1_stage2_raw.pth')
+    print("已保存 Stage 2 checkpoint (无 EMA) → scheme1_stage2_raw.pth")
 
 
 # ============================================================
-# Stage 3: L-BFGS 精调 (固定 φ, 从 EMA 参数出发)
+# Stage 3: L-BFGS 精调 (固定 φ, 从 EMA 参数出发, 带 early stopping)
 # ============================================================
 print("\n" + "=" * 70)
-print("Stage 3: L-BFGS 精调 (从 EMA 参数出发)")
+print("Stage 3: L-BFGS 精调 (从 EMA 参数出发, 带 early stopping)")
 print("=" * 70)
 timer.start("Stage3_LBFGS")
 
@@ -907,6 +993,15 @@ lbfgs = torch.optim.LBFGS(
     history_size=20, line_search_fn='strong_wolfe'
 )
 history_s3 = {'total': [], 'rel_err': []}
+
+# ---- Early stopping 状态 ----
+best_rel_err = compute_rel_err(v_net, S_flat, t_flat, V_fdm_grid, cfg)
+best_state = {k: v.clone() for k, v in v_net.state_dict().items()}
+patience = 10
+patience_counter = 0
+stopped_early = False
+
+print(f"  初始 RelErr = {best_rel_err:.6f}, patience = {patience}")
 
 for step in range(cfg.stage3_steps):
     def closure():
@@ -928,15 +1023,36 @@ for step in range(cfg.stage3_steps):
     history_s3['total'].append(lv)
     history_s3['rel_err'].append(rel_err)
 
-    if (step + 1) % 10 == 0:
-        print(f"  Step {step + 1}/{cfg.stage3_steps} | Loss={lv:.6f} | RelErr={rel_err:.4f}")
+    # ---- Early stopping 检查 ----
+    if rel_err < best_rel_err:
+        best_rel_err = rel_err
+        best_state = {k: v.clone() for k, v in v_net.state_dict().items()}
+        patience_counter = 0
+    else:
+        patience_counter += 1
+
+    if (step + 1) % 10 == 0 or patience_counter > 0:
+        print(f"  Step {step + 1}/{cfg.stage3_steps} | Loss={lv:.6f} | "
+              f"RelErr={rel_err:.6f} | Best={best_rel_err:.6f} | "
+              f"Patience={patience_counter}/{patience}")
+
+    if patience_counter >= patience:
+        print(f"  Early stopping at step {step + 1}: "
+              f"RelErr 未改善连续 {patience} 步")
+        stopped_early = True
+        break
+
+# ---- 恢复最佳参数 ----
+v_net.load_state_dict(best_state)
+final_rel_err = compute_rel_err(v_net, S_flat, t_flat, V_fdm_grid, cfg)
 
 s3_time = timer.stop("Stage3_LBFGS")
 print(f"Stage 3 完成. 耗时 {s3_time:.1f}s")
-
+print(f"  Early stopped: {stopped_early}")
+print(f"  最终 RelErr (best restored) = {final_rel_err:.6f}")
 
 # ============================================================
-# 保存结果
+# 保存结果 (使用 Stage 3 best restored 的 v_net 参数)
 # ============================================================
 print("\n保存结果...")
 timer.start("SaveResults")
@@ -970,10 +1086,10 @@ history = {
 with open('scheme1_history.json', 'w') as f:
     json.dump(history, f)
 
+# 保存最终模型: v_net 是 Stage 3 best restored 参数, 不再保存过时的 EMA
 torch.save({
     'v_net': v_net.state_dict(),
     'phi_net': phi_net.state_dict(),
-    'ema': ema.state_dict(),
     'config': {k: v for k, v in vars(cfg).items()
                if not k.startswith('_') and not isinstance(v, torch.device)},
 }, 'scheme1_best.pth')
@@ -988,7 +1104,7 @@ print(f"  scheme1_results.npz")
 print(f"  scheme1_history.json")
 print(f"  scheme1_best.pth")
 print(f"  scheme1_stage2_raw.pth  (非EMA参数备份)")
-print(f"\n最终 V RelErr = {history_s3['rel_err'][-1]:.6f}")
+print(f"\n最终 V RelErr (best restored) = {final_rel_err:.6f}")
 
 # 打印计时汇总
 print(timer.summary())
