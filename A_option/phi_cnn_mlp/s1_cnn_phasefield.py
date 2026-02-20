@@ -8,6 +8,8 @@ scheme1_cnn_phasefield.py
   2. 界面能只在内部点计算, 避免边界伪梯度
   3. 消除重复前向传播, 复用 V_norm_pred
   4. φ 标签用距离变换+sigmoid 替代高斯平滑
+  5. EMA (Exponential Moving Average) for v_net in Stage 2
+  6. 分阶段计时器
 """
 
 import torch
@@ -73,6 +75,9 @@ class Config:
     anchor_decay_end = 20000
     anchor_min_ratio = 0.3
 
+    # EMA
+    ema_decay = 0.999
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     seed = 42
 
@@ -88,6 +93,114 @@ def set_seed(seed):
 
 
 set_seed(cfg.seed)
+
+
+# ============================================================
+# 分阶段计时器
+# ============================================================
+class StageTimer:
+    """记录每个训练阶段的墙钟时间，支持嵌套标记."""
+
+    def __init__(self):
+        self.records = {}       # {stage_name: elapsed_seconds}
+        self._stack = []        # 当前活跃的 (name, start_time)
+        self.global_start = time.perf_counter()
+
+    def start(self, name: str):
+        self._stack.append((name, time.perf_counter()))
+
+    def stop(self, name: str = None):
+        if not self._stack:
+            raise RuntimeError("StageTimer: no active stage to stop")
+        rec_name, t0 = self._stack.pop()
+        if name is not None and rec_name != name:
+            raise RuntimeError(
+                f"StageTimer: expected to stop '{rec_name}', got '{name}'")
+        elapsed = time.perf_counter() - t0
+        self.records[rec_name] = self.records.get(rec_name, 0.0) + elapsed
+        return elapsed
+
+    def total(self):
+        return time.perf_counter() - self.global_start
+
+    def summary(self):
+        total = self.total()
+        lines = ["\n" + "=" * 60,
+                 "  计时汇总 (wall-clock)",
+                 "=" * 60]
+        for name, secs in self.records.items():
+            pct = secs / total * 100 if total > 0 else 0
+            lines.append(f"  {name:<25s}  {secs:8.1f}s  ({pct:5.1f}%)")
+        lines.append(f"  {'TOTAL':<25s}  {total:8.1f}s  (100.0%)")
+        lines.append("=" * 60)
+        return "\n".join(lines)
+
+
+timer = StageTimer()
+
+
+# ============================================================
+# EMA (Exponential Moving Average)
+# ============================================================
+class EMA:
+    """对模型参数维护指数移动平均.
+
+    用法:
+        ema = EMA(model, decay=0.999)
+        # 每个训练步后:
+        ema.update()
+        # 评估时:
+        ema.apply_shadow()   # 将影子参数写入模型
+        ... evaluate ...
+        ema.restore()        # 恢复原始参数
+        # 训练结束, 永久切换:
+        ema.apply_shadow()   # 不再 restore
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.model = model
+        self.decay = decay
+        # 影子参数: 深拷贝当前参数
+        self.shadow = {}
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[name] = p.data.clone()
+        self.backup = {}
+
+    def update(self):
+        """用当前模型参数更新影子参数."""
+        for name, p in self.model.named_parameters():
+            if name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(
+                    p.data, alpha=1.0 - self.decay)
+
+    def apply_shadow(self):
+        """将影子参数写入模型, 备份原始参数."""
+        self.backup = {}
+        for name, p in self.model.named_parameters():
+            if name in self.shadow:
+                self.backup[name] = p.data.clone()
+                p.data.copy_(self.shadow[name])
+
+    def restore(self):
+        """从备份恢复原始参数 (撤销 apply_shadow)."""
+        for name, p in self.model.named_parameters():
+            if name in self.backup:
+                p.data.copy_(self.backup[name])
+        self.backup = {}
+
+    def state_dict(self):
+        """用于保存 checkpoint."""
+        return {
+            'shadow': {k: v.cpu() for k, v in self.shadow.items()},
+            'decay': self.decay,
+        }
+
+    def load_state_dict(self, state):
+        self.decay = state['decay']
+        for k, v in state['shadow'].items():
+            if k in self.shadow:
+                self.shadow[k] = v.to(self.shadow[k].device)
 
 
 # ============================================================
@@ -150,10 +263,11 @@ def generate_fdm_american_put(cfg):
 # ============================================================
 # 生成 FDM 参考解
 # ============================================================
+timer.start("FDM")
 print("生成 FDM 参考解...")
-t0 = time.time()
 S_fdm, t_fdm, V_fdm = generate_fdm_american_put(cfg)
-print(f"FDM 完成. 耗时 {time.time() - t0:.1f}s, shape={V_fdm.shape}, "
+fdm_elapsed = timer.stop("FDM")
+print(f"FDM 完成. 耗时 {fdm_elapsed:.1f}s, shape={V_fdm.shape}, "
       f"V range: [{V_fdm.min():.4f}, {V_fdm.max():.4f}]")
 
 fdm_interp = RegularGridInterpolator(
@@ -188,6 +302,8 @@ fdm_boundary = extract_fdm_boundary(S_fdm, t_fdm, V_fdm, cfg.K)
 # ============================================================
 # 在 PINN 网格上准备数据
 # ============================================================
+timer.start("DataPrep")
+
 def get_fdm_on_grid(cfg, fdm_interp):
     S_np = np.linspace(0, cfg.S_max, cfg.grid_S)
     t_np = np.linspace(0, cfg.T, cfg.grid_t)
@@ -201,7 +317,6 @@ V_fdm_grid = get_fdm_on_grid(cfg, fdm_interp)
 V_fdm_norm = V_fdm_grid / cfg.K
 
 
-# 修正4: 用距离变换 + sigmoid 构建 φ 标签
 def build_phi_target(cfg, S_fdm, t_fdm, V_fdm):
     payoff_fdm = np.maximum(cfg.K - S_fdm, 0.0)
     phi_fdm = np.ones_like(V_fdm)
@@ -211,7 +326,6 @@ def build_phi_target(cfg, S_fdm, t_fdm, V_fdm):
         exercise_mask = (diff < 1e-3 * cfg.K) & in_the_money
         phi_fdm[i, exercise_mask] = 0.0
 
-    # 最近邻插值到 PINN 网格
     phi_interp = RegularGridInterpolator(
         (t_fdm, S_fdm), phi_fdm,
         method='nearest', bounds_error=False, fill_value=1.0
@@ -222,13 +336,12 @@ def build_phi_target(cfg, S_fdm, t_fdm, V_fdm):
     points = np.stack([tt_p.ravel(), ss_p.ravel()], axis=-1)
     phi_hard = phi_interp(points).reshape(cfg.grid_t, cfg.grid_S)
 
-    # 距离变换 + sigmoid (比高斯更保边界)
     continuation = (phi_hard > 0.5).astype(float)
     dist_pos = distance_transform_edt(continuation)
     dist_neg = distance_transform_edt(1 - continuation)
     signed_dist = dist_pos - dist_neg
 
-    transition_width = 1.2  # 像素
+    transition_width = 1.2
     phi_smooth = 1.0 / (1.0 + np.exp(-signed_dist / (transition_width * 0.5)))
     phi_smooth = np.clip(phi_smooth, 0.02, 0.98)
 
@@ -241,30 +354,28 @@ print(f"φ 目标标签: mean={phi_target.mean():.4f}, min={phi_target.min():.4f
 print(f"  行权区 (φ<0.1): {(phi_target < 0.1).float().mean():.4f}")
 print(f"  继续区 (φ>0.9): {(phi_target > 0.9).float().mean():.4f}")
 
-# 构建归一化网格坐标 (预计算, 不在循环中重复构建)
+# 构建归一化网格坐标
 S_vals = torch.linspace(0, 1, cfg.grid_S, device=cfg.device)
 t_vals = torch.linspace(0, 1, cfg.grid_t, device=cfg.device)
 tt, ss = torch.meshgrid(t_vals, S_vals, indexing='ij')
 
-S_grid = ss.unsqueeze(0).unsqueeze(0)  # (1,1,H,W) CNN 坐标通道
+S_grid = ss.unsqueeze(0).unsqueeze(0)
 t_grid = tt.unsqueeze(0).unsqueeze(0)
 
-# 预计算展平坐标 (Stage 1/2/3 共用)
-S_flat = ss.reshape(-1, 1)  # (N, 1) 归一化 [0,1]
-t_flat = tt.reshape(-1, 1)  # (N, 1) 归一化 [0,1]
+S_flat = ss.reshape(-1, 1)
+t_flat = tt.reshape(-1, 1)
 N_grid = S_flat.shape[0]
 
-# 归一化 payoff
-payoff_grid = torch.clamp(cfg.K - ss * cfg.S_max, min=0.0) / cfg.K  # (grid_t, grid_S)
+payoff_grid = torch.clamp(cfg.K - ss * cfg.S_max, min=0.0) / cfg.K
 payoff_flat = payoff_grid.reshape(-1, 1)
 
-# FDM 行权区比例
 exercise_ratio = (phi_target < 0.5).float().mean().item()
 print(f"  FDM 行权区比例: {exercise_ratio:.4f}")
 
-# 有限差分步长
 dS_norm = 1.0 / (cfg.grid_S - 1)
 dt_norm = 1.0 / (cfg.grid_t - 1)
+
+timer.stop("DataPrep")
 
 
 # ============================================================
@@ -375,12 +486,6 @@ print(f"Phi_net 参数量: {sum(p.numel() for p in phi_net.parameters()):,}")
 # 辅助函数
 # ============================================================
 def compute_bs_residual(v_net, S_norm, t_norm, cfg):
-    """
-    计算 BS PDE 残差.
-    S_norm, t_norm: (N,1), 归一化 [0,1].
-    内部 detach+requires_grad 创建独立叶节点, autograd 逐点正确求导.
-    返回: V_norm (N,1), residual_norm (N,1)
-    """
     S_n = S_norm.detach().requires_grad_(True)
     t_n = t_norm.detach().requires_grad_(True)
     V_norm = v_net(S_n, t_n)
@@ -390,7 +495,6 @@ def compute_bs_residual(v_net, S_norm, t_norm, cfg):
     dV_dt = torch.autograd.grad(V_norm, t_n, grad_outputs=ones, create_graph=True)[0]
     d2V_dS2 = torch.autograd.grad(dV_dS, S_n, grad_outputs=ones, create_graph=True)[0]
 
-    # 链式法则: V = K*V_norm, S = S_max*S_n, t = T*t_n
     S = S_n * cfg.S_max
     V_t = (cfg.K / cfg.T) * dV_dt
     V_S = (cfg.K / cfg.S_max) * dV_dS
@@ -402,28 +506,19 @@ def compute_bs_residual(v_net, S_norm, t_norm, cfg):
 
 
 def phi_gradient_fd_inner(phi, dS, dt):
-    """
-    修正: 只在内部点 (H-2, W-2) 上用中心差分计算 |∇φ|²,
-    避免边界处前向/后向差分产生伪梯度.
-    phi: (grid_t, grid_S) 或 (1,1,H,W)
-    """
     if phi.dim() == 2:
         phi = phi.unsqueeze(0).unsqueeze(0)
 
-    # S 方向中心差分 -> (1,1,H, W-2)
     dphi_dS = (phi[:, :, :, 2:] - phi[:, :, :, :-2]) / (2 * dS)
-    # t 方向中心差分 -> (1,1,H-2, W)
     dphi_dt = (phi[:, :, 2:, :] - phi[:, :, :-2, :]) / (2 * dt)
 
-    # 取公共内部区域 (H-2, W-2)
-    dphi_dS_inner = dphi_dS[:, :, 1:-1, :]  # (1,1,H-2,W-2)
-    dphi_dt_inner = dphi_dt[:, :, :, 1:-1]  # (1,1,H-2,W-2)
+    dphi_dS_inner = dphi_dS[:, :, 1:-1, :]
+    dphi_dt_inner = dphi_dt[:, :, :, 1:-1]
 
     return (dphi_dS_inner ** 2 + dphi_dt_inner ** 2).squeeze()
 
 
 def focal_bce(pred, target, gamma=2.0):
-    """Focal Loss: 放大难分类样本权重"""
     pred = pred.clamp(1e-6, 1 - 1e-6)
     bce = -target * torch.log(pred) - (1 - target) * torch.log(1 - pred)
     p_t = pred * target + (1 - pred) * (1 - target)
@@ -432,7 +527,6 @@ def focal_bce(pred, target, gamma=2.0):
 
 
 def compute_bc_loss(v_net, cfg):
-    """边界条件损失: V(0,t)=K, V(S_max,t)=0, V(S,T)=payoff"""
     n_bc = cfg.grid_t
     t_bc = torch.linspace(0, 1, n_bc, device=cfg.device).unsqueeze(1)
 
@@ -455,7 +549,6 @@ def compute_bc_loss(v_net, cfg):
 
 
 def compute_rel_err(v_net, S_flat, t_flat, V_fdm_grid, cfg):
-    """计算 V 的相对 L2 误差"""
     with torch.no_grad():
         V_pred = v_net(S_flat, t_flat).reshape(cfg.grid_t, cfg.grid_S) * cfg.K
         return (torch.norm(V_pred - V_fdm_grid) / (torch.norm(V_fdm_grid) + 1e-8)).item()
@@ -467,6 +560,7 @@ def compute_rel_err(v_net, S_flat, t_flat, V_fdm_grid, cfg):
 print("\n" + "=" * 70)
 print("Stage 1: MLP预热 (FDM监督)")
 print("=" * 70)
+timer.start("Stage1_MLP")
 
 V_target_flat = V_fdm_norm.reshape(-1, 1)
 
@@ -500,7 +594,8 @@ for epoch in range(1, cfg.stage1_epochs + 1):
               f"RelErr={rel_err:.4f} | "
               f"V pred [mean={vp.mean():.4f}, min={vp.min():.4f}, max={vp.max():.4f}]")
 
-print(f"Stage 1 完成. RelErr = {history_s1['rel_err'][-1]:.6f}")
+s1_time = timer.stop("Stage1_MLP")
+print(f"Stage 1 完成. RelErr = {history_s1['rel_err'][-1]:.6f}, 耗时 {s1_time:.1f}s")
 
 
 # ============================================================
@@ -509,14 +604,14 @@ print(f"Stage 1 完成. RelErr = {history_s1['rel_err'][-1]:.6f}")
 print("\n" + "=" * 70)
 print("Stage 1.5: φ Warm-Start")
 print("=" * 70)
+timer.start("Stage1.5_CNN")
 
-phi_target_4d = phi_target.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+phi_target_4d = phi_target.unsqueeze(0).unsqueeze(0)
 
-# 用当前 MLP 输出构建 CNN 输入
 with torch.no_grad():
     V_init_map = v_net(S_flat, t_flat).reshape(1, 1, cfg.grid_t, cfg.grid_S)
 
-cnn_input_ws = torch.cat([S_grid, t_grid, V_init_map.detach()], dim=1)  # (1,3,H,W)
+cnn_input_ws = torch.cat([S_grid, t_grid, V_init_map.detach()], dim=1)
 
 opt15 = torch.optim.Adam(phi_net.parameters(), lr=cfg.stage15_lr)
 sch15 = torch.optim.lr_scheduler.CosineAnnealingLR(opt15, T_max=cfg.stage15_epochs, eta_min=1e-5)
@@ -554,7 +649,6 @@ for epoch in range(1, cfg.stage15_epochs + 1):
             ex_frac = (p < 0.1).float().mean().item()
             cont_frac = (p > 0.9).float().mean().item()
 
-            # ---- 保存记录 ----
             history_s1_5['stage15_bce_list'].append(bce_val)
             history_s1_5['stage15_phi_mean_list'].append(p_mean)
             history_s1_5['stage15_phi_std_list'].append(p_std)
@@ -577,56 +671,55 @@ with torch.no_grad():
     print(f"  行权区(φ<0.1): {(p < 0.1).float().mean():.1%} | "
           f"继续区(φ>0.9): {(p > 0.9).float().mean():.1%}")
 
-# 写入 history 
+s15_time = timer.stop("Stage1.5_CNN")
+print(f"Stage 1.5 耗时 {s15_time:.1f}s")
+
 
 # ============================================================
-# Stage 2: 联合训练 (Phase-Field Energy + Anchor)
+# Stage 2: 联合训练 (Phase-Field Energy + Anchor + EMA)
 # ============================================================
 print("\n" + "=" * 70)
-print("Stage 2: 联合训练 (Phase-Field Energy + Anchor)")
+print("Stage 2: 联合训练 (Phase-Field Energy + Anchor + EMA)")
 print("=" * 70)
+timer.start("Stage2_Joint")
 
 opt_mlp = torch.optim.AdamW(v_net.parameters(), lr=cfg.stage2_lr_mlp, weight_decay=1e-5)
 opt_cnn = torch.optim.AdamW(phi_net.parameters(), lr=cfg.stage2_lr_cnn, weight_decay=1e-5)
 sch_mlp = torch.optim.lr_scheduler.CosineAnnealingLR(opt_mlp, T_max=cfg.stage2_epochs, eta_min=1e-6)
 sch_cnn = torch.optim.lr_scheduler.CosineAnnealingLR(opt_cnn, T_max=cfg.stage2_epochs, eta_min=1e-5)
 
+# 初始化 EMA (从 Stage 1 结束后的 v_net 参数开始)
+ema = EMA(v_net, decay=cfg.ema_decay)
+
 history_s2 = {
     'pde': [], 'exercise': [], 'interface': [], 'anchor': [],
-    'balance': [], 'bc': [], 'total': [], 'rel_err': []
+    'balance': [], 'bc': [], 'total': [],
+    'rel_err_raw': [], 'rel_err_ema': []
 }
 
-# 预计算 anchor 标签 (展平)
 phi_anchor_flat = phi_target.reshape(-1, 1)
 
 for epoch in range(1, cfg.stage2_epochs + 1):
     v_net.train()
     phi_net.train()
 
-    # ---- 1. V 前向 + BS 残差 (一次前向, 修正3) ----
-    S_n = S_flat.detach().requires_grad_(True)
-    t_n = t_flat.detach().requires_grad_(True)
-    V_norm_pred, bs_residual = compute_bs_residual(v_net, S_n, t_n, cfg)
+    # ---- 1. V 前向 + BS 残差 ----
+    V_norm_pred, bs_residual = compute_bs_residual(v_net, S_flat, t_flat, cfg)
 
-    # ---- 2. φ (CNN), 复用 V_norm_pred (修正3) ----
+    # ---- 2. φ (CNN) ----
     V_map = V_norm_pred.detach().reshape(1, 1, cfg.grid_t, cfg.grid_S)
     cnn_input = torch.cat([S_grid, t_grid, V_map], dim=1)
     phi_full = phi_net(cnn_input)
-    phi_2d = phi_full.squeeze()       # (H, W)
-    phi_flat = phi_2d.reshape(-1, 1)  # (N, 1)
+    phi_2d = phi_full.squeeze()
+    phi_flat = phi_2d.reshape(-1, 1)
 
     # ---- 3. Phase-Field Energy ----
-
-    # Term 1: PDE (φ * |LV|²)
     pde_loss = (phi_flat * bs_residual ** 2).mean()
-
-    # Term 2: Exercise ((1-φ)² |V-Ψ|² / ε)
     exercise_loss = ((1 - phi_flat) ** 2 * (V_norm_pred - payoff_flat) ** 2).mean() / cfg.eps
 
-    # Term 3: Interface — 只在内部点 (修正2)
     phi_inner = phi_2d[1:-1, 1:-1]
     W_phi_inner = phi_inner ** 2 * (1 - phi_inner) ** 2
-    grad_phi_sq = phi_gradient_fd_inner(phi_2d, dS_norm, dt_norm)  # (H-2, W-2)
+    grad_phi_sq = phi_gradient_fd_inner(phi_2d, dS_norm, dt_norm)
     interface_loss = (cfg.eps * grad_phi_sq + W_phi_inner / cfg.eps).mean()
 
     # ---- 4. Anchor (Focal BCE) ----
@@ -667,8 +760,16 @@ for epoch in range(1, cfg.stage2_epochs + 1):
     sch_mlp.step()
     sch_cnn.step()
 
+    # ---- EMA 更新 (每步都更新) ----
+    ema.update()
+
     # ---- 记录 ----
-    rel_err = compute_rel_err(v_net, S_flat, t_flat, V_fdm_grid, cfg)
+    rel_err_raw = compute_rel_err(v_net, S_flat, t_flat, V_fdm_grid, cfg)
+
+    # EMA RelErr: 临时切换到影子参数评估
+    ema.apply_shadow()
+    rel_err_ema = compute_rel_err(v_net, S_flat, t_flat, V_fdm_grid, cfg)
+    ema.restore()
 
     history_s2['pde'].append(pde_loss.item())
     history_s2['exercise'].append(exercise_loss.item())
@@ -677,7 +778,8 @@ for epoch in range(1, cfg.stage2_epochs + 1):
     history_s2['balance'].append(balance_loss.item())
     history_s2['bc'].append(bc_loss.item())
     history_s2['total'].append(total.item())
-    history_s2['rel_err'].append(rel_err)
+    history_s2['rel_err_raw'].append(rel_err_raw)
+    history_s2['rel_err_ema'].append(rel_err_ema)
 
     if epoch % 1000 == 0:
         with torch.no_grad():
@@ -686,28 +788,50 @@ for epoch in range(1, cfg.stage2_epochs + 1):
                   f"PDE={pde_loss.item():.6f} | Ex={exercise_loss.item():.6f} | "
                   f"Int={interface_loss.item():.4f} | Anc={anchor_loss.item():.6f} | "
                   f"Bal={balance_loss.item():.6f} | BC={bc_loss.item():.6f} | "
-                  f"Total={total.item():.4f} | RelErr={rel_err:.4f} | "
+                  f"Total={total.item():.4f} | "
+                  f"RelErr(raw)={rel_err_raw:.4f} | RelErr(ema)={rel_err_ema:.4f} | "
                   f"AncW={anchor_w:.1f} | "
-                  f"φ [mean={p.mean():.3f}, std={p.std():.3f}, "
-                  f"min={p.min():.3f}, max={p.max():.3f}]")
+                  f"φ [mean={p.mean():.3f}, std={p.std():.3f}]")
+
+s2_time = timer.stop("Stage2_Joint")
+print(f"\nStage 2 完成. 耗时 {s2_time:.1f}s")
+print(f"  最终 RelErr(raw) = {history_s2['rel_err_raw'][-1]:.6f}")
+print(f"  最终 RelErr(ema) = {history_s2['rel_err_ema'][-1]:.6f}")
 
 
 # ============================================================
-# Stage 3: L-BFGS 精调 (固定 φ)
+# Stage 2 → Stage 3 过渡: 保存 raw 参数, 切换到 EMA
+# ============================================================
+# 保存 raw (非 EMA) 的 checkpoint
+torch.save({
+    'v_net_raw': v_net.state_dict(),
+    'phi_net': phi_net.state_dict(),
+    'ema': ema.state_dict(),
+}, 'scheme1_stage2_raw.pth')
+print("已保存 Stage 2 raw checkpoint → scheme1_stage2_raw.pth")
+
+# 永久切换到 EMA 参数 (不再 restore)
+ema.apply_shadow()
+rel_err_after_ema = compute_rel_err(v_net, S_flat, t_flat, V_fdm_grid, cfg)
+print(f"EMA 参数已应用. RelErr(ema→active) = {rel_err_after_ema:.6f}")
+
+
+# ============================================================
+# Stage 3: L-BFGS 精调 (固定 φ, 从 EMA 参数出发)
 # ============================================================
 print("\n" + "=" * 70)
-print("Stage 3: L-BFGS 精调")
+print("Stage 3: L-BFGS 精调 (从 EMA 参数出发)")
 print("=" * 70)
+timer.start("Stage3_LBFGS")
 
 phi_net.eval()
 for p_param in phi_net.parameters():
     p_param.requires_grad_(False)
 
-# 固定 φ map
 with torch.no_grad():
     V_map_s3 = v_net(S_flat, t_flat).reshape(1, 1, cfg.grid_t, cfg.grid_S)
     cnn_in_s3 = torch.cat([S_grid, t_grid, V_map_s3], dim=1)
-    phi_fixed = phi_net(cnn_in_s3).squeeze()  # (H, W)
+    phi_fixed = phi_net(cnn_in_s3).squeeze()
     phi_fixed_flat = phi_fixed.reshape(-1, 1)
 
 lbfgs = torch.optim.LBFGS(
@@ -719,9 +843,7 @@ history_s3 = {'total': [], 'rel_err': []}
 for step in range(cfg.stage3_steps):
     def closure():
         lbfgs.zero_grad()
-        S_n = S_flat.detach().requires_grad_(True)
-        t_n = t_flat.detach().requires_grad_(True)
-        V_n, bs_res = compute_bs_residual(v_net, S_n, t_n, cfg)
+        V_n, bs_res = compute_bs_residual(v_net, S_flat, t_flat, cfg)
 
         pde = (phi_fixed_flat * bs_res ** 2).mean()
         ex = ((1 - phi_fixed_flat) ** 2 * (V_n - payoff_flat) ** 2).mean() / cfg.eps
@@ -741,11 +863,15 @@ for step in range(cfg.stage3_steps):
     if (step + 1) % 10 == 0:
         print(f"  Step {step + 1}/{cfg.stage3_steps} | Loss={lv:.6f} | RelErr={rel_err:.4f}")
 
+s3_time = timer.stop("Stage3_LBFGS")
+print(f"Stage 3 完成. 耗时 {s3_time:.1f}s")
+
 
 # ============================================================
 # 保存结果
 # ============================================================
 print("\n保存结果...")
+timer.start("SaveResults")
 
 with torch.no_grad():
     V_final_norm = v_net(S_flat, t_flat).reshape(cfg.grid_t, cfg.grid_S)
@@ -779,12 +905,22 @@ with open('scheme1_history.json', 'w') as f:
 torch.save({
     'v_net': v_net.state_dict(),
     'phi_net': phi_net.state_dict(),
+    'ema': ema.state_dict(),
     'config': {k: v for k, v in vars(cfg).items()
                if not k.startswith('_') and not isinstance(v, torch.device)},
 }, 'scheme1_best.pth')
 
-print("所有结果已保存!")
+timer.stop("SaveResults")
+
+# ============================================================
+# 最终汇总
+# ============================================================
+print("\n所有结果已保存!")
 print(f"  scheme1_results.npz")
 print(f"  scheme1_history.json")
 print(f"  scheme1_best.pth")
+print(f"  scheme1_stage2_raw.pth  (非EMA参数备份)")
 print(f"\n最终 V RelErr = {history_s3['rel_err'][-1]:.6f}")
+
+# 打印计时汇总
+print(timer.summary())
