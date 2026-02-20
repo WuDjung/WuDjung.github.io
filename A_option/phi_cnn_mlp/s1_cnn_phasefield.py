@@ -553,7 +553,57 @@ def compute_rel_err(v_net, S_flat, t_flat, V_fdm_grid, cfg):
         V_pred = v_net(S_flat, t_flat).reshape(cfg.grid_t, cfg.grid_S) * cfg.K
         return (torch.norm(V_pred - V_fdm_grid) / (torch.norm(V_fdm_grid) + 1e-8)).item()
 
+class WarmupCosineScheduler:
+    """线性 Warmup + Cosine Decay 学习率调度.
+    
+    epoch 0 ~ warmup_epochs-1:  lr 从 lr_max * warmup_ratio 线性增到 lr_max
+    epoch warmup_epochs ~ total_epochs-1:  lr 从 lr_max 余弦衰减到 eta_min
 
+    """
+
+    def __init__(self, optimizer, total_epochs, warmup_epochs,
+                 eta_min=1e-6, warmup_ratio=0.1):
+        self.optimizer = optimizer
+        self.total_epochs = total_epochs
+        self.warmup_epochs = warmup_epochs
+        self.eta_min = eta_min
+        self.warmup_ratio = warmup_ratio
+
+        # 记录每个 param_group 的初始 lr 作为 lr_max
+        self.base_lrs = [pg['lr'] for pg in optimizer.param_groups]
+        self._step_count = 0
+
+        # 设置初始 lr 为 warmup 起点
+        self._set_lr(self._compute_lr(0))
+
+    def _compute_lr(self, step):
+        """计算第 step 步 (0-indexed) 每个 param_group 的 lr."""
+        lrs = []
+        for base_lr in self.base_lrs:
+            if step < self.warmup_epochs:
+                # 线性 warmup: lr_init → lr_max
+                lr_init = base_lr * self.warmup_ratio
+                lr = lr_init + (base_lr - lr_init) * step / self.warmup_epochs
+            else:
+                # Cosine decay: lr_max → eta_min
+                cos_steps = self.total_epochs - self.warmup_epochs
+                cos_progress = step - self.warmup_epochs
+                import math
+                lr = self.eta_min + 0.5 * (base_lr - self.eta_min) * (
+                    1 + math.cos(math.pi * cos_progress / cos_steps))
+            lrs.append(lr)
+        return lrs
+
+    def _set_lr(self, lrs):
+        for pg, lr in zip(self.optimizer.param_groups, lrs):
+            pg['lr'] = lr
+
+    def step(self):
+        self._step_count += 1
+        self._set_lr(self._compute_lr(self._step_count))
+
+    def get_last_lr(self):
+        return [pg['lr'] for pg in self.optimizer.param_groups]
 # ============================================================
 # Stage 1: MLP 预热 (FDM 监督)
 # ============================================================
@@ -685,16 +735,31 @@ timer.start("Stage2_Joint")
 
 opt_mlp = torch.optim.AdamW(v_net.parameters(), lr=cfg.stage2_lr_mlp, weight_decay=1e-5)
 opt_cnn = torch.optim.AdamW(phi_net.parameters(), lr=cfg.stage2_lr_cnn, weight_decay=1e-5)
-sch_mlp = torch.optim.lr_scheduler.CosineAnnealingLR(opt_mlp, T_max=cfg.stage2_epochs, eta_min=1e-6)
-sch_cnn = torch.optim.lr_scheduler.CosineAnnealingLR(opt_cnn, T_max=cfg.stage2_epochs, eta_min=1e-5)
 
-# 初始化 EMA (从 Stage 1 结束后的 v_net 参数开始)
+# ---- 修改: Warmup + Cosine Decay 替换 CosineAnnealingLR ----
+sch_mlp = WarmupCosineScheduler(
+    opt_mlp,
+    total_epochs=cfg.stage2_epochs,
+    warmup_epochs=1000,        # 5% of 20000
+    eta_min=1e-6,
+    warmup_ratio=0.1           # 从 lr_max 的 1/10 起步
+)
+sch_cnn = WarmupCosineScheduler(
+    opt_cnn,
+    total_epochs=cfg.stage2_epochs,
+    warmup_epochs=1000,
+    eta_min=1e-5,
+    warmup_ratio=0.1
+)
+
+# 初始化 EMA
 ema = EMA(v_net, decay=cfg.ema_decay)
 
 history_s2 = {
     'pde': [], 'exercise': [], 'interface': [], 'anchor': [],
     'balance': [], 'bc': [], 'total': [],
-    'rel_err_raw': [], 'rel_err_ema': []
+    'rel_err_raw': [], 'rel_err_ema': [],
+    'lr_mlp': [], 'lr_cnn': []          # 新增: 记录 lr 曲线
 }
 
 phi_anchor_flat = phi_target.reshape(-1, 1)
@@ -760,16 +825,17 @@ for epoch in range(1, cfg.stage2_epochs + 1):
     sch_mlp.step()
     sch_cnn.step()
 
-    # ---- EMA 更新 (每步都更新) ----
+    # ---- EMA 更新 ----
     ema.update()
 
     # ---- 记录 ----
     rel_err_raw = compute_rel_err(v_net, S_flat, t_flat, V_fdm_grid, cfg)
-
-    # EMA RelErr: 临时切换到影子参数评估
     ema.apply_shadow()
     rel_err_ema = compute_rel_err(v_net, S_flat, t_flat, V_fdm_grid, cfg)
     ema.restore()
+
+    cur_lr_mlp = sch_mlp.get_last_lr()[0]
+    cur_lr_cnn = sch_cnn.get_last_lr()[0]
 
     history_s2['pde'].append(pde_loss.item())
     history_s2['exercise'].append(exercise_loss.item())
@@ -780,6 +846,8 @@ for epoch in range(1, cfg.stage2_epochs + 1):
     history_s2['total'].append(total.item())
     history_s2['rel_err_raw'].append(rel_err_raw)
     history_s2['rel_err_ema'].append(rel_err_ema)
+    history_s2['lr_mlp'].append(cur_lr_mlp)
+    history_s2['lr_cnn'].append(cur_lr_cnn)
 
     if epoch % 1000 == 0:
         with torch.no_grad():
@@ -791,13 +859,13 @@ for epoch in range(1, cfg.stage2_epochs + 1):
                   f"Total={total.item():.4f} | "
                   f"RelErr(raw)={rel_err_raw:.4f} | RelErr(ema)={rel_err_ema:.4f} | "
                   f"AncW={anchor_w:.1f} | "
+                  f"lr_mlp={cur_lr_mlp:.2e} | lr_cnn={cur_lr_cnn:.2e} | "
                   f"φ [mean={p.mean():.3f}, std={p.std():.3f}]")
 
 s2_time = timer.stop("Stage2_Joint")
 print(f"\nStage 2 完成. 耗时 {s2_time:.1f}s")
 print(f"  最终 RelErr(raw) = {history_s2['rel_err_raw'][-1]:.6f}")
 print(f"  最终 RelErr(ema) = {history_s2['rel_err_ema'][-1]:.6f}")
-
 
 # ============================================================
 # Stage 2 → Stage 3 过渡: 保存 raw 参数, 切换到 EMA
